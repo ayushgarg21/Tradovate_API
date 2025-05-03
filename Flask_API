@@ -1,0 +1,233 @@
+
+[from flask import Flask, request, jsonify
+import requests
+import json
+import logging
+import threading
+import time
+
+app = Flask(__name__)
+
+# Tradovate Credentials (REDACTED FOR PUBLIC REPO)
+username = "your_username"
+password = "your_password"
+app_id = "your_app_id"
+app_version = "your_app_version"
+device_id = "your_device_id"
+client_id = "your_client_id"
+client_secret = "your_client_secret"
+
+# API URLs
+api_url = "https://demo.tradovateapi.com/v1/order/placeoso"
+token_url = "https://demo.tradovateapi.com/v1/auth/accesstokenrequest"
+cancel_url = "https://demo.tradovateapi.com/v1/order/cancel"
+liquidate_url = "https://demo.tradovateapi.com/v1/order/liquidatePosition"
+
+# Tradovate Account Details
+account_id = YOUR_ACCOUNT_ID
+account_spec = "YOUR_ACCOUNT_SPEC"
+
+# Webhook Secret
+SECRET_KEY = ""
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
+
+# Global token store
+access_token = None
+
+def round_down(price, tick_size=0.25):
+    return (int(float(price) / tick_size)) * tick_size
+
+def round_up(price, tick_size=0.25):
+    return ((int(float(price) / tick_size)) + 1) * tick_size
+
+def round_nearest(price, tick_size=0.25):
+    return round(float(price) / tick_size) * tick_size
+
+def get_access_token():
+    global access_token
+    payload = {
+        "name": username,
+        "password": password,
+        "appId": app_id,
+        "appVersion": app_version,
+        "deviceId": device_id,
+        "cid": client_id,
+        "sec": client_secret
+    }
+    headers = {"accept": "application/json", "Content-Type": "application/json"}
+    response = requests.post(token_url, headers=headers, json=payload)
+    if response.status_code == 200:
+        data = response.json()
+        access_token = data.get("accessToken")
+        logger.info(f"New Access Token Retrieved: {access_token}")
+    else:
+        logger.error(f"Failed to get access token: {response.text}")
+
+def refresh_token_periodically():
+    while True:
+        get_access_token()
+        time.sleep(1200)
+
+token_refresh_thread = threading.Thread(target=refresh_token_periodically, daemon=True)
+token_refresh_thread.start()
+
+def auto_exit_trade():
+    global access_token
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    time.sleep(600)
+    logger.info("5 minutes passed. Checking if position is still open...")
+    response_positions = requests.get("https://demo.tradovateapi.com/v1/position/list", headers=headers)
+    if response_positions.status_code == 200:
+        positions = response_positions.json()
+        if not positions:
+            logger.info("No open positions found. Auto-exit not required.")
+            return
+        contract_id = positions[0]["contractId"]
+    else:
+        logger.error(f"Failed to fetch open positions: {response_positions.text}")
+        return
+
+    payload = {
+        "accountId": account_id,
+        "contractId": contract_id,
+        "admin": False
+    }
+    response = requests.post(liquidate_url, headers=headers, json=payload)
+    if response.status_code == 200:
+        logger.info("Auto-exit triggered: Trade closed after 5 minutes.")
+    else:
+        logger.error(f"Failed to auto-exit trade: {response.text}")
+
+def cancel_unfilled_orders_after_timeout(timeout=10):
+    global access_token
+    time.sleep(timeout)
+    logger.info(f"{timeout} seconds passed. Cancelling unfilled orders...")
+
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    response = requests.get("https://demo.tradovateapi.com/v1/order/working", headers=headers)
+    if response.status_code == 200:
+        open_orders = response.json()
+        if not open_orders:
+            logger.info("No working orders to cancel.")
+            return
+
+        for order in open_orders:
+            order_id = order["id"]
+            cancel_payload = {"orderId": order_id}
+            cancel_response = requests.post(cancel_url, headers=headers, json=cancel_payload)
+            if cancel_response.status_code == 200:
+                logger.info(f"Cancelled Order ID: {order_id}")
+            else:
+                logger.error(f"Failed to cancel order {order_id}: {cancel_response.text}")
+    else:
+        logger.error(f"Failed to fetch working orders: {response.text}")
+
+def place_trade(order_type, entry_price, stop_loss, take_profit):
+    global access_token
+
+    if not stop_loss or not take_profit:
+        logger.error("Stop Loss & Take Profit required for OSO orders!")
+        return
+
+    try:
+        entry_price = float(entry_price)
+        stop_loss = float(stop_loss)
+        take_profit = float(take_profit)
+
+        if order_type == "buy":
+            tp_rounded = round_down(take_profit)
+            sl_rounded = round_down(stop_loss)
+        else:
+            tp_rounded = round_up(take_profit)
+            sl_rounded = round_up(stop_loss)
+
+        entry_price = round_nearest(entry_price)
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+
+        oso_payload = {
+            "accountSpec": account_spec,
+            "accountId": account_id,
+            "action": "Buy" if order_type == "buy" else "Sell",
+            "symbol": "MNQM5",
+            "orderQty": 1,
+            "orderType": "Limit",
+            "price": entry_price,
+            "isAutomated": True,
+            "bracket1": {
+                "action": "Sell" if order_type == "buy" else "Buy",
+                "orderType": "Limit",
+                "price": tp_rounded
+            },
+            "bracket2": {
+                "action": "Sell" if order_type == "buy" else "Buy",
+                "orderType": "Stop",
+                "stopPrice": sl_rounded
+            }
+        }
+
+        logger.info(f"Sending OSO Order: {json.dumps(oso_payload, indent=2)}")
+
+        response = requests.post(api_url, headers=headers, json=oso_payload)
+
+        if response.status_code == 200:
+            order_data = response.json()
+            logger.info(f"OSO Order Placed Successfully: {json.dumps(order_data, indent=2)}")
+            threading.Thread(target=auto_exit_trade, daemon=True).start()
+            threading.Thread(target=cancel_unfilled_orders_after_timeout, daemon=True).start()
+        else:
+            logger.error(f"OSO Order Failed: {response.text}")
+
+    except ValueError as e:
+        logger.error(f"Invalid number format in order parameters: {e}")
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    try:
+        data = request.get_json()
+        logger.info(f"Received data: {data}")
+
+        if data.get("secret") != SECRET_KEY:
+            logger.error("Invalid webhook secret!")
+            return jsonify({"message": "Forbidden: Invalid secret"}), 403
+
+        signal = data.get("side")
+        entry_price = data.get("entry")
+        tp = data.get("tp")
+        sl = data.get("sl")
+
+        if not signal or not entry_price or not tp or not sl:
+            logger.error("Missing required values")
+            return jsonify({"message": "Error: Missing required values"}), 400
+
+        signal = signal.lower()
+        if signal not in ["buy", "sell"]:
+            logger.error(f"Invalid trade side: {signal}")
+            return jsonify({"message": "Error: Invalid trade side"}), 400
+
+        logger.info(f"Trade Info - Side: {signal}, Entry: {entry_price}, TP: {tp}, SL: {sl}")
+
+        place_trade(signal, entry_price, sl, tp)
+
+        return jsonify({"message": "OSO Order placed successfully"}), 200
+
+    except Exception as e:
+        logger.error(f"Error processing webhook: {e}")
+        return jsonify({"message": "Error processing webhook"}), 500
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5001)
+]
