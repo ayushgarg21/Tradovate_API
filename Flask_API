@@ -1,50 +1,74 @@
+import os
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
 
-[from flask import Flask, request, jsonify
+# Load environment variables from bot.env file
+load_dotenv('bot.env')
 import requests
 import json
 import logging
 import threading
 import time
+from datetime import datetime
+import pytz
 
 app = Flask(__name__)
 
-# Tradovate Credentials (REDACTED FOR PUBLIC REPO)
-username = "your_username"
-password = "your_password"
-app_id = "your_app_id"
-app_version = "your_app_version"
-device_id = "your_device_id"
-client_id = "your_client_id"
-client_secret = "your_client_secret"
+# SECURE: Load credentials from environment variables only
+username = os.getenv("TRADOVATE_USERNAME")
+password = os.getenv("TRADOVATE_PASSWORD")
+app_id = os.getenv("TRADOVATE_APP_ID")
+app_version = "0.0.1"
+device_id = os.getenv("TRADOVATE_DEVICE_ID")
+client_id = os.getenv("TRADOVATE_CLIENT_ID")
+client_secret = os.getenv("TRADOVATE_CLIENT_SECRET")
 
-# API URLs
-api_url = "https://demo.tradovateapi.com/v1/order/placeoso"
-token_url = "https://demo.tradovateapi.com/v1/auth/accesstokenrequest"
-cancel_url = "https://demo.tradovateapi.com/v1/order/cancel"
-liquidate_url = "https://demo.tradovateapi.com/v1/order/liquidatePosition"
+# API URLs (LIVE)
+token_url = "https://live.tradovateapi.com/v1/auth/accesstokenrequest"
+liquidate_url = "https://live.tradovateapi.com/v1/order/liquidatePosition"
 
-# Tradovate Account Details
-account_id = YOUR_ACCOUNT_ID
-account_spec = "YOUR_ACCOUNT_SPEC"
+# Tradovate LIVE Account Details
+account_id = int(os.getenv("TRADOVATE_ACCOUNT_ID"))
+account_spec = os.getenv("TRADOVATE_ACCOUNT_SPEC")
 
-# Webhook Secret
-SECRET_KEY = ""
+# SECURE: Webhook secret from environment
+SECRET_KEY = os.getenv("WEBHOOK_SECRET")
 
-# Logging setup
+# Check that all required environment variables are set
+required_vars = [
+    "TRADOVATE_USERNAME", "TRADOVATE_PASSWORD", "TRADOVATE_APP_ID",
+    "TRADOVATE_DEVICE_ID", "TRADOVATE_CLIENT_ID", "TRADOVATE_CLIENT_SECRET",
+    "TRADOVATE_ACCOUNT_ID", "TRADOVATE_ACCOUNT_SPEC", "WEBHOOK_SECRET"
+]
+
+missing_vars = [var for var in required_vars if not os.getenv(var)]
+if missing_vars:
+    print(f"ERROR: Missing required environment variables: {', '.join(missing_vars)}")
+    print("Please set these environment variables before running the bot.")
+    exit(1)
+
+# SECURE: Don't log sensitive info
+class SecureFormatter(logging.Formatter):
+    def format(self, record):
+        # Remove sensitive data from log messages
+        if hasattr(record, 'msg'):
+            msg = str(record.msg)
+            # Hide tokens and passwords
+            if 'accessToken' in msg or 'password' in msg.lower():
+                record.msg = "Authentication completed (details hidden)"
+        return super().format(record)
+
+# Setup logging without sensitive data
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger()
+handler = logging.StreamHandler()
+handler.setFormatter(SecureFormatter())
+logger.handlers = [handler]
 
-# Global token store
+# Global Variables
 access_token = None
-
-def round_down(price, tick_size=0.25):
-    return (int(float(price) / tick_size)) * tick_size
-
-def round_up(price, tick_size=0.25):
-    return ((int(float(price) / tick_size)) + 1) * tick_size
-
-def round_nearest(price, tick_size=0.25):
-    return round(float(price) / tick_size) * tick_size
+last_trade_time = 0
+cooldown_period = 10
 
 def get_access_token():
     global access_token
@@ -60,174 +84,365 @@ def get_access_token():
     headers = {"accept": "application/json", "Content-Type": "application/json"}
     response = requests.post(token_url, headers=headers, json=payload)
     if response.status_code == 200:
-        data = response.json()
-        access_token = data.get("accessToken")
-        logger.info(f"New Access Token Retrieved: {access_token}")
+        access_token = response.json().get("accessToken")
+        logger.info("New Access Token Retrieved (details hidden)")
     else:
-        logger.error(f"Failed to get access token: {response.text}")
+        logger.error(f"Failed to get access token: Status {response.status_code}")
 
 def refresh_token_periodically():
     while True:
         get_access_token()
         time.sleep(1200)
 
-token_refresh_thread = threading.Thread(target=refresh_token_periodically, daemon=True)
-token_refresh_thread.start()
+threading.Thread(target=refresh_token_periodically, daemon=True).start()
+
+def is_ny_session():
+    """
+    Check if current time is during NY trading session (9:30 AM - 4:00 PM ET)
+    """
+    ny_tz = pytz.timezone('America/New_York')
+    current_time = datetime.now(ny_tz)
+    
+    # NY session: 9:30 AM to 4:00 PM Eastern Time
+    session_start = current_time.replace(hour=9, minute=30, second=0, microsecond=0)
+    session_end = current_time.replace(hour=16, minute=0, second=0, microsecond=0)
+    
+    # Check if it's a weekday (Monday=0, Sunday=6)
+    is_weekday = current_time.weekday() < 5
+    
+    return is_weekday and session_start <= current_time <= session_end
+
+def monitor_tsl(entry_netliq, trail_trigger, trail_amt, tls, order_type):
+    global access_token
+    logger.info("Starting TSL Monitor Thread...")
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+    tsl_placed = False
+    api_call_count = 0
+    while not tsl_placed:
+        try:
+            # Dynamic sleep interval based on NY session
+            if is_ny_session():
+                check_interval = 0.3  # Fast checking during NY session
+                session_status = "NY SESSION"
+            else:
+                check_interval = 0.5  # Slower checking outside NY session
+                session_status = "OFF-HOURS"
+            
+            api_call_count += 1
+            
+            # First check: are we still in a trade?
+            res = requests.get("https://live.tradovateapi.com/v1/position/list", headers=headers)
+            
+            # Enhanced logging for API responses
+            if res.status_code == 429:
+                logger.error(f"RATE LIMIT HIT on position/list - API calls made: {api_call_count}")
+                logger.error(f"Response headers: {dict(res.headers)}")
+                time.sleep(30)  # Wait longer for rate limits
+                continue
+            elif res.status_code != 200:
+                logger.error(f"Position API error - Status: {res.status_code}, Response: {res.text}")
+                return
+
+            positions = res.json()
+            if not positions or all(pos.get("netPos", 0) == 0 for pos in positions):
+                logger.info(f"No open position found. TSL monitor exiting. Total API calls: {api_call_count}")
+                return
+
+            # Then check netLiq
+            api_call_count += 1
+            res = requests.post("https://live.tradovateapi.com/v1/cashBalance/getcashbalancesnapshot", headers=headers, json={"accountId": account_id})
+            
+            if res.status_code == 429:
+                logger.error(f"RATE LIMIT HIT on cashBalance - API calls made: {api_call_count}")
+                time.sleep(30)  # Wait longer for rate limits
+                continue
+            elif res.status_code == 200:
+                current_netliq = float(res.json()["netLiq"])
+                profit = current_netliq - entry_netliq
+                
+                # Exit if trade is losing significantly
+                if profit < -20:
+                    logger.info(f"Trade losing ${abs(profit):.2f} - TSL monitoring stopped")
+                    return
+                
+                logger.info(f"[{session_status}] TSL Check: profit = {profit:.2f}, trigger = {trail_trigger} (API calls: {api_call_count})")
+
+                if profit >= float(trail_trigger):
+                    logger.info("TSL Trigger Met! Attempting to place TSL...")
+                    tsl_success = place_trailing_sl_order(order_type, float(tls), float(trail_amt))
+                    if tsl_success:
+                        logger.info("TSL placed successfully. Monitor exiting.")
+                        tsl_placed = True
+                    else:
+                        logger.warning("TSL placement failed. Will retry on next check.")
+            else:
+                logger.error(f"TSL netLiq failed - Status: {res.status_code}, Response: {res.text}")
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error in TSL monitor: {e}")
+        except Exception as e:
+            logger.error(f"TSL monitor error: {e}")
+            
+        time.sleep(check_interval)  # Dynamic interval based on session
+
+def place_trailing_sl_order(order_type, tls_price, trail_amt):
+    global access_token
+    try:
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        sl_action = "Sell" if order_type.lower() == "buy" else "Buy"
+
+        payload = {
+            "accountId": account_id,
+            "symbol": "MNQZ5",  # FIXED: Consistent symbol
+            "orderQty": 1,
+            "orderType": "TrailingStop",
+            "stopPrice": tls_price,
+            "trailAmount": trail_amt,
+            "timeInForce": "Day",
+            "action": sl_action
+        }
+        logger.info("Placing TSL order...")
+        response = requests.post("https://live.tradovateapi.com/v1/order/placeOrder", headers=headers, json=payload)
+        if response.status_code == 200:
+            logger.info("TSL Order Placed")
+            return True
+        else:
+            logger.error(f"TSL Failed: {response.status_code} - {response.text}")
+            return False
+    except Exception as e:
+        logger.error(f"TSL Error: {e}")
+        return False
+
+def capture_entry_netliq(headers):
+    """Capture netLiq before trade entry in parallel"""
+    try:
+        snap = requests.post("https://live.tradovateapi.com/v1/cashBalance/getcashbalancesnapshot", 
+                            headers=headers, json={"accountId": account_id})
+        if snap.status_code == 200:
+            entry_netliq = float(snap.json()["netLiq"])
+            logger.info(f"Pre-trade netLiq captured: {entry_netliq}")
+            return entry_netliq
+        else:
+            logger.error(f"Failed to capture pre-trade netLiq: {snap.status_code}")
+            return None
+    except Exception as e:
+        logger.error(f"Error capturing pre-trade netLiq: {e}")
+        return None
+
+def place_trade(order_type, entry_price, stop_loss, take_profit, trail_trigger=None, trail_amt=None, tls=None):
+    global access_token
+    try:
+        take_profit = float(take_profit)
+        entry_price = float(entry_price)
+        stop_loss = float(stop_loss)
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        action = "Buy" if order_type.lower() == "buy" else "Sell"
+
+        # PARALLEL: Capture pre-trade netLiq in background while placing order
+        entry_netliq_container = [None]  # Using list to store result from thread
+        
+        def capture_baseline():
+            entry_netliq_container[0] = capture_entry_netliq(headers)
+        
+        # Start capturing baseline in parallel
+        baseline_thread = threading.Thread(target=capture_baseline, daemon=True)
+        baseline_thread.start()
+
+        # Market Entry (happens immediately, no delay)
+        payload = {
+            "accountId": account_id,
+            "symbol": "MNQZ5",  # FIXED: Consistent symbol
+            "orderQty": 1,
+            "orderType": "Market",
+            "timeInForce": "Day",
+            "action": action
+        }
+        logger.info("Placing market order...")
+        res = requests.post("https://live.tradovateapi.com/v1/order/placeOrder", headers=headers, json=payload)
+        if res.status_code == 200:
+            logger.info("Market Order Placed")
+            time.sleep(2)
+
+            # Take Profit
+            tp_action = "Sell" if action == "Buy" else "Buy"
+            tp_payload = {
+                "accountId": account_id,
+                "symbol": "MNQZ5",  # FIXED: Consistent symbol
+                "orderQty": 1,
+                "orderType": "Limit",
+                "price": take_profit,
+                "timeInForce": "Day",
+                "action": tp_action
+            }
+            requests.post("https://live.tradovateapi.com/v1/order/placeOrder", headers=headers, json=tp_payload)
+            logger.info("TP Order Sent")
+            time.sleep(1)
+
+            # Regular SL
+            place_regular_sl_order(order_type, stop_loss)
+
+            # Launch TSL monitor if fields are provided
+            if trail_trigger and trail_amt and tls:
+                # Wait for baseline capture to complete
+                baseline_thread.join(timeout=2)  # Wait max 2 seconds
+                entry_netliq = entry_netliq_container[0]
+                
+                if entry_netliq is not None:
+                    logger.info(f"Using pre-trade netLiq as baseline: {entry_netliq}")
+                    threading.Thread(
+                        target=monitor_tsl,
+                        args=(entry_netliq, trail_trigger, trail_amt, tls, order_type),
+                        daemon=True
+                    ).start()
+                else:
+                    logger.warning("Failed to capture pre-trade netLiq. TSL monitor not started.")
+
+            threading.Thread(target=auto_exit_trade, daemon=True).start()
+            threading.Thread(target=monitor_trade_pnl, daemon=True).start()
+        else:
+            logger.error(f"Market Entry Failed: {res.status_code}")
+    except Exception as e:
+        logger.error(f"Trade Error: {e}")
+
+def place_regular_sl_order(order_type, stop_loss_price):
+    global access_token
+    try:
+        stop_loss_price = float(stop_loss_price)
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        sl_action = "Sell" if order_type.lower() == "buy" else "Buy"
+        payload = {
+            "accountId": account_id,
+            "symbol": "MNQZ5",  # FIXED: Consistent symbol
+            "orderQty": 1,
+            "orderType": "Stop",
+            "stopPrice": stop_loss_price,
+            "timeInForce": "Day",
+            "action": sl_action
+        }
+        logger.info("Placing SL order...")
+        response = requests.post("https://live.tradovateapi.com/v1/order/placeOrder", headers=headers, json=payload)
+        if response.status_code == 200:
+            logger.info("SL Order Placed")
+        else:
+            logger.error(f"SL Failed: {response.status_code}")
+    except Exception as e:
+        logger.error(f"SL Error: {e}")
 
 def auto_exit_trade():
     global access_token
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-    time.sleep(600)
-    logger.info("5 minutes passed. Checking if position is still open...")
-    response_positions = requests.get("https://demo.tradovateapi.com/v1/position/list", headers=headers)
-    if response_positions.status_code == 200:
-        positions = response_positions.json()
-        if not positions:
-            logger.info("No open positions found. Auto-exit not required.")
-            return
-        contract_id = positions[0]["contractId"]
-    else:
-        logger.error(f"Failed to fetch open positions: {response_positions.text}")
-        return
-
-    payload = {
-        "accountId": account_id,
-        "contractId": contract_id,
-        "admin": False
-    }
-    response = requests.post(liquidate_url, headers=headers, json=payload)
-    if response.status_code == 200:
-        logger.info("Auto-exit triggered: Trade closed after 5 minutes.")
-    else:
-        logger.error(f"Failed to auto-exit trade: {response.text}")
-
-def cancel_unfilled_orders_after_timeout(timeout=10):
-    global access_token
-    time.sleep(timeout)
-    logger.info(f"{timeout} seconds passed. Cancelling unfilled orders...")
-
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-
-    response = requests.get("https://demo.tradovateapi.com/v1/order/working", headers=headers)
-    if response.status_code == 200:
-        open_orders = response.json()
-        if not open_orders:
-            logger.info("No working orders to cancel.")
-            return
-
-        for order in open_orders:
-            order_id = order["id"]
-            cancel_payload = {"orderId": order_id}
-            cancel_response = requests.post(cancel_url, headers=headers, json=cancel_payload)
-            if cancel_response.status_code == 200:
-                logger.info(f"Cancelled Order ID: {order_id}")
-            else:
-                logger.error(f"Failed to cancel order {order_id}: {cancel_response.text}")
-    else:
-        logger.error(f"Failed to fetch working orders: {response.text}")
-
-def place_trade(order_type, entry_price, stop_loss, take_profit):
-    global access_token
-
-    if not stop_loss or not take_profit:
-        logger.error("Stop Loss & Take Profit required for OSO orders!")
-        return
-
-    try:
-        entry_price = float(entry_price)
-        stop_loss = float(stop_loss)
-        take_profit = float(take_profit)
-
-        if order_type == "buy":
-            tp_rounded = round_down(take_profit)
-            sl_rounded = round_down(stop_loss)
-        else:
-            tp_rounded = round_up(take_profit)
-            sl_rounded = round_up(stop_loss)
-
-        entry_price = round_nearest(entry_price)
-
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Content-Type": "application/json"
-        }
-
-        oso_payload = {
-            "accountSpec": account_spec,
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    time.sleep(1200)  # 12 minutes auto-exit
+    logger.info("12 minutes passed. Checking for open positions...")
+    response = requests.get("https://live.tradovateapi.com/v1/position/list", headers=headers)
+    if response.status_code == 200 and response.json():
+        contract_id = response.json()[0]["contractId"]
+        payload = {
             "accountId": account_id,
-            "action": "Buy" if order_type == "buy" else "Sell",
-            "symbol": "MNQM5",
-            "orderQty": 1,
-            "orderType": "Limit",
-            "price": entry_price,
-            "isAutomated": True,
-            "bracket1": {
-                "action": "Sell" if order_type == "buy" else "Buy",
-                "orderType": "Limit",
-                "price": tp_rounded
-            },
-            "bracket2": {
-                "action": "Sell" if order_type == "buy" else "Buy",
-                "orderType": "Stop",
-                "stopPrice": sl_rounded
-            }
+            "contractId": contract_id,
+            "admin": False
         }
-
-        logger.info(f"Sending OSO Order: {json.dumps(oso_payload, indent=2)}")
-
-        response = requests.post(api_url, headers=headers, json=oso_payload)
-
+        response = requests.post(liquidate_url, headers=headers, json=payload)
         if response.status_code == 200:
-            order_data = response.json()
-            logger.info(f"OSO Order Placed Successfully: {json.dumps(order_data, indent=2)}")
-            threading.Thread(target=auto_exit_trade, daemon=True).start()
-            threading.Thread(target=cancel_unfilled_orders_after_timeout, daemon=True).start()
+            logger.info("Auto-exit: Trade closed after 12 minutes.")
         else:
-            logger.error(f"OSO Order Failed: {response.text}")
+            logger.error(f"Auto-exit failed: {response.status_code}")
 
-    except ValueError as e:
-        logger.error(f"Invalid number format in order parameters: {e}")
+def monitor_trade_pnl():
+    global access_token
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    logger.info("Starting position monitor...")
+    while True:
+        try:
+            res = requests.get("https://live.tradovateapi.com/v1/position/list", headers=headers)
+            if res.status_code != 200:
+                time.sleep(1)
+                continue
+            positions = res.json()
+            if not positions or all(pos.get("netPos", 0) == 0 for pos in positions):
+                logger.info("No open positions. Cancelling exit orders...")
+                cancel_all_working_orders(headers)
+                break
+        except Exception as e:
+            logger.error(f"Trade monitor error: {e}")
+        time.sleep(1)
+
+def get_open_orders(headers):
+    try:
+        response = requests.get("https://live.tradovateapi.com/v1/order/list", headers=headers)
+        if response.status_code == 200:
+            return response.json()
+    except Exception as e:
+        logger.error(f"get_open_orders error: {e}")
+    return []
+
+def cancel_all_working_orders(headers):
+    orders = get_open_orders(headers)
+    for order in orders:
+        if order.get("status") not in ["Filled", "Cancelled", "Rejected", "Expired"]:
+            payload = {"orderId": order["id"], "isAutomated": False}
+            response = requests.post("https://live.tradovateapi.com/v1/order/cancelorder", headers=headers, json=payload)
+            if response.status_code == 200:
+                logger.info(f"Cancelled Order ID: {order['id']}")
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    global last_trade_time
     try:
-        data = request.get_json()
-        logger.info(f"Received data: {data}")
-
+        # Handle both JSON and form data
+        if request.is_json:
+            data = request.get_json()
+            logger.info("Webhook received (JSON)")
+        else:
+            # Try to handle form data or plain text
+            if request.form:
+                data = request.form.to_dict()
+                logger.info("Webhook received (Form data)")
+            else:
+                # Try to parse as JSON from raw data
+                import json
+                data = json.loads(request.get_data(as_text=True))
+                logger.info("Webhook received (Raw JSON)")
+        
+        logger.info(f"Webhook data keys: {list(data.keys()) if data else 'No data'}")
+        
         if data.get("secret") != SECRET_KEY:
-            logger.error("Invalid webhook secret!")
-            return jsonify({"message": "Forbidden: Invalid secret"}), 403
+            return jsonify({"message": "Forbidden"}), 403
+        now = time.time()
+        if now - last_trade_time < cooldown_period:
+            return jsonify({"message": "Cooldown active"}), 429
 
         signal = data.get("side")
-        entry_price = data.get("entry")
+        entry = data.get("entry")
         tp = data.get("tp")
         sl = data.get("sl")
+        trail_trigger = data.get("trail_sl_trigger_profit_dollars")
+        trail_amt = data.get("trail_amt")
+        tls = data.get("tls")
 
-        if not signal or not entry_price or not tp or not sl:
-            logger.error("Missing required values")
-            return jsonify({"message": "Error: Missing required values"}), 400
+        # Reduce trail_trigger by $1 if provided
+        if trail_trigger:
+            trail_trigger = float(trail_trigger) - 0
+            logger.info(f"Trail trigger set: {trail_trigger}")
 
-        signal = signal.lower()
-        if signal not in ["buy", "sell"]:
-            logger.error(f"Invalid trade side: {signal}")
-            return jsonify({"message": "Error: Invalid trade side"}), 400
+        if not signal or not entry or not tp:
+            return jsonify({"message": "Missing parameters"}), 400
+        if signal.lower() not in ["buy", "sell"]:
+            return jsonify({"message": "Invalid side"}), 400
 
-        logger.info(f"Trade Info - Side: {signal}, Entry: {entry_price}, TP: {tp}, SL: {sl}")
-
-        place_trade(signal, entry_price, sl, tp)
-
-        return jsonify({"message": "OSO Order placed successfully"}), 200
-
+        last_trade_time = now
+        place_trade(signal, entry, sl, tp, trail_trigger, trail_amt, tls)
+        return jsonify({"message": "Order placed"}), 200
     except Exception as e:
-        logger.error(f"Error processing webhook: {e}")
-        return jsonify({"message": "Error processing webhook"}), 500
+        logger.error(f"Webhook error: {e}")
+        return jsonify({"message": "Internal error"}), 500
+
+@app.route("/", methods=["GET"])
+def health_check():
+    return jsonify({"status": "running"}), 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001)
-]
+    app.run(host="0.0.0.0", port=80, debug=False)
